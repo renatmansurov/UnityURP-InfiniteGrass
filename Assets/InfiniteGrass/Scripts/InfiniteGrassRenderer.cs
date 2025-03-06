@@ -1,187 +1,207 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using UnityEngine;
-using static Unity.Burst.Intrinsics.X86.Avx;
 
 [ExecuteAlways]
 public class InfiniteGrassRenderer : MonoBehaviour
 {
-    [HideInInspector] public static InfiniteGrassRenderer instance;//Global ref of the script
+	public static InfiniteGrassRenderer Instance; //Global ref of the script
+	private static readonly int CenterPos = Shader.PropertyToID("_CenterPos");
+	private static readonly int DrawDistance = Shader.PropertyToID("_DrawDistance");
+	private static readonly int TextureUpdateThreshold = Shader.PropertyToID("_TextureUpdateThreshold");
 
-    [Header("Internal")]
-    public Material grassMaterial;
-    public ComputeBuffer argsBuffer;
-    public ComputeBuffer tBuffer;//Just a temp buffer to preview the visible grass count
+	[Header("Internal")] public Material grassMaterial;
 
-    [Header("Grass Properties")]
-    public float spacing = 0.5f;//Spacing between blades, Please don't make it too low
-    public float drawDistance = 300;
-    public float fullDensityDistance = 50;//After this distance, we start removing some blades of grass in sake of performance
-    public int grassMeshSubdivision = 5;//How many sections you will have in your grass blade mesh, 0 will give a triangle, having more sections will make the wind animation and the curvature looks better
-    public float textureUpdateThreshold = 10.0f;//The distance that the camera should move before we update the "Data Textures"
+	[Header("Grass Properties")] public float spacing = 0.5f; //Spacing between blades, Please don't make it too low
+	public float drawDistance = 300;
+	public float fullDensityDistance = 50; //After this distance, we start removing some blades of grass in sake of performance
+	public int grassMeshSubdivision = 5; //How many sections you will have in your grass blade mesh, 0 will give a triangle, having more sections will make the wind animation and the curvature looks better
+	public float textureUpdateThreshold = 10.0f; //The distance that the camera should move before we update the "Data Textures"
 
-    [Header("Max Buffer Count (Millions)")]
-    public float maxBufferCount = 2;//The number we gonna use to initialize the positions buffer
-    //Don't make it too high cause that gonna impact performance, usually 2 - 3 should be enough unless you are using a crazy spacing
-    //Also don't make it too low cause it's gonna negativly impact the performance
+	[Header("Max Buffer Count (Millions)")]
+	public float maxBufferCount = 2; //The number we gonna use to initialize the positions buffer
+	//Don't make it too high cause that gonna impact performance, usually 2 - 3 should be enough unless you are using a crazy spacing
+	//Also don't make it too low cause it's gonna negativly impact the performance
 
-    [Header("Debug (Enabling this will make the performance drop a lot)")]
-    public bool previewVisibleGrassCount = false;
+	[Header("Debug (Enabling this will make the performance drop a lot)")]
+	public bool previewVisibleGrassCount;
 
-    private Mesh cachedGrassMesh;
+	public Camera mainCamera;
+	public ComputeBuffer ArgsBuffer;
 
-    private void OnEnable()
-    {
-        instance = this;
-    }
+	private Mesh cachedGrassMesh;
 
-    private void OnDisable()
-    {
-        instance = null;
+	int oldSubdivision = -1;
+	public ComputeBuffer TemporalBuffer; //Just a temp buffer to preview the visible grass count
 
-        argsBuffer?.Release();
-        tBuffer?.Release();
-    }
+	private void Start()
+	{
+		mainCamera = Camera.main;
+	}
 
-    void LateUpdate()
-    {
-        argsBuffer?.Release();
-        tBuffer?.Release();
+	private void LateUpdate()
+	{
+		ReleaseBuffers();
 
-        if (spacing == 0 || grassMaterial == null) return;
+		if (spacing == 0 || !grassMaterial) return;
 
-        Bounds cameraBounds = CalculateCameraBounds(Camera.main);
-        Vector2 centerPos = new Vector2(Mathf.Floor(Camera.main.transform.position.x / textureUpdateThreshold) * textureUpdateThreshold, Mathf.Floor(Camera.main.transform.position.z / textureUpdateThreshold) * textureUpdateThreshold);
-        
-        //Args Buffer ---------------------------------------------------------------------------------
-        argsBuffer = new ComputeBuffer(1, 5 * sizeof(uint), ComputeBufferType.IndirectArguments);
-        tBuffer = new ComputeBuffer(1, sizeof(uint), ComputeBufferType.Raw);
+		var cameraBounds = CalculateCameraBounds(mainCamera, drawDistance);
+		var centerPos = CalculateCenterPosition(mainCamera, textureUpdateThreshold);
 
-        uint[] args = new uint[5];
-        args[0] = (uint)GetGrassMeshCache().GetIndexCount(0);
-        args[1] = (uint)(maxBufferCount * 1000000);
-        args[2] = (uint)GetGrassMeshCache().GetIndexStart(0);
-        args[3] = (uint)GetGrassMeshCache().GetBaseVertex(0);
-        args[4] = 0;
-        argsBuffer.SetData(args);
+		InitializeBuffers();
+		SetupMaterial(centerPos);
 
-        //Material Setup ------------------------------------------------------------
-        grassMaterial.SetVector("_CenterPos", centerPos);
-        grassMaterial.SetFloat("_DrawDistance", drawDistance);
-        grassMaterial.SetFloat("_TextureUpdateThreshold", textureUpdateThreshold);
+		Graphics.DrawMeshInstancedIndirect(GetGrassMeshCache(), 0, grassMaterial, cameraBounds, ArgsBuffer);
+	}
 
-        //Big Draw Call -------------------------------------------------------------
-        Graphics.DrawMeshInstancedIndirect(GetGrassMeshCache(), 0, grassMaterial, cameraBounds, argsBuffer);
-    }
+	private void OnEnable()
+	{
+		Instance = this;
+	}
 
-    private void OnGUI()
-    {
-        if (previewVisibleGrassCount)
-        {
-            GUI.contentColor = Color.black;
-            GUIStyle style = new GUIStyle();
-            style.fontSize = 25;
+	private void OnDisable()
+	{
+		Instance = null;
 
-            uint[] count = new uint[1];
-            tBuffer.GetData(count);//Reading back data from GPU
+		ArgsBuffer?.Release();
+		TemporalBuffer?.Release();
+	}
 
-            //Recalculating the GridSize used for dispatching
-            Bounds cameraBounds = CalculateCameraBounds(Camera.main);
-            Vector2Int gridSize = new Vector2Int(Mathf.CeilToInt(cameraBounds.size.x / spacing), Mathf.CeilToInt(cameraBounds.size.z / spacing));
+	private void OnGUI()
+	{
+		if (previewVisibleGrassCount)
+		{
+			GUI.contentColor = Color.black;
+			var style = new GUIStyle
+			{
+				fontSize = 25
+			};
 
-            GUI.Label(new Rect(50, 50, 400, 200), "Dispatch Size : " + gridSize.x + "x" + gridSize.y + " = " + (gridSize.x * gridSize.y), style);
-            GUI.Label(new Rect(50, 80, 400, 200), "Visible Grass Count : " + count[0], style);
-        }
-    }
+			var count = new uint[1];
+			TemporalBuffer.GetData(count); //Reading back data from GPU
 
-    int oldSubdivision = -1;
-    public Mesh GetGrassMeshCache() //Code to generate the grass blade mesh based on the subdivision value
-    {
-        if (!cachedGrassMesh || oldSubdivision != grassMeshSubdivision)//Dont update unless its necessary
-        {
-            cachedGrassMesh = new Mesh();
+			//Recalculating the GridSize used for dispatching
+			var cameraBounds = CalculateCameraBounds(mainCamera, drawDistance);
+			var gridSize = new Vector2Int(Mathf.CeilToInt(cameraBounds.size.x / spacing), Mathf.CeilToInt(cameraBounds.size.z / spacing));
 
-            Vector3[] vertices = new Vector3[3 + 4 * grassMeshSubdivision];//Total number of vertices
-            int[] triangles = new int[(1 + 2 * grassMeshSubdivision) * 3];//(Total number of faces) * 3
+			GUI.Label(new Rect(50, 50, 400, 200), "Dispatch Size : " + gridSize.x + "x" + gridSize.y + " = " + (gridSize.x * gridSize.y), style);
+			GUI.Label(new Rect(50, 80, 400, 200), "Visible Grass Count : " + count[0], style);
+		}
+	}
 
-            for (int i = 0; i < grassMeshSubdivision; i++)
-            {
-                float y1 = (float)i / (grassMeshSubdivision + 1);
-                float y2 = (float)(i + 1) / (grassMeshSubdivision + 1);
+	private void ReleaseBuffers()
+	{
+		ArgsBuffer?.Release();
+		TemporalBuffer?.Release();
+	}
 
-                Vector3 bottomLeft = new Vector3(-0.25f, y1);
-                Vector3 bottomRight = new Vector3(0.25f, y1);
-                Vector3 topLeft = new Vector3(-0.25f, y2);
-                Vector3 topRight = new Vector3(0.25f, y2);
+	private static Vector2 CalculateCenterPosition(Camera camera, float textureUpdateThreshold)
+	{
+		return new Vector2(
+			Mathf.Floor(camera.transform.position.x / textureUpdateThreshold) * textureUpdateThreshold,
+			Mathf.Floor(camera.transform.position.z / textureUpdateThreshold) * textureUpdateThreshold
+		);
+	}
 
-                int bottomLeftIndex = i * 4;
-                int bottomRightIndex = i * 4 + 1;
-                int topLeftIndex = i * 4 + 2;
-                int topRightIndex = i * 4 + 3;
+	private void InitializeBuffers()
+	{
+		ArgsBuffer = new ComputeBuffer(1, 5 * sizeof(uint), ComputeBufferType.IndirectArguments);
+		TemporalBuffer = new ComputeBuffer(1, sizeof(uint), ComputeBufferType.Raw);
 
-                vertices[bottomLeftIndex] = bottomLeft;
-                vertices[bottomRightIndex] = bottomRight;
-                vertices[topLeftIndex] = topLeft;
-                vertices[topRightIndex] = topRight;
+		var args = new uint[5];
+		args[0] = GetGrassMeshCache().GetIndexCount(0);
+		args[1] = (uint)(maxBufferCount * 1000000);
+		args[2] = GetGrassMeshCache().GetIndexStart(0);
+		args[3] = GetGrassMeshCache().GetBaseVertex(0);
+		args[4] = 0;
+		ArgsBuffer.SetData(args);
+	}
 
-                //First Face
-                triangles[i * 6] = bottomLeftIndex;
-                triangles[i * 6 + 1] = topRightIndex;
-                triangles[i * 6 + 2] = bottomRightIndex;
-                //Second Face
-                triangles[i * 6 + 3] = bottomLeftIndex;
-                triangles[i * 6 + 4] = topLeftIndex;
-                triangles[i * 6 + 5] = topRightIndex;
-            }
+	private void SetupMaterial(Vector2 centerPos)
+	{
+		grassMaterial.SetVector(CenterPos, centerPos);
+		grassMaterial.SetFloat(DrawDistance, drawDistance);
+		grassMaterial.SetFloat(TextureUpdateThreshold, textureUpdateThreshold);
+	}
 
-            //Finally the last triangle on top
-            vertices[grassMeshSubdivision * 4] = new Vector3(-0.25f, (float)grassMeshSubdivision / (grassMeshSubdivision + 1));
-            vertices[grassMeshSubdivision * 4 + 1] = new Vector3(0, 1);
-            vertices[grassMeshSubdivision * 4 + 2] = new Vector3(0.25f, (float)grassMeshSubdivision / (grassMeshSubdivision + 1));
+	private Mesh GetGrassMeshCache()
+	{
+		if (cachedGrassMesh && oldSubdivision == grassMeshSubdivision) return cachedGrassMesh;
 
-            triangles[grassMeshSubdivision * 6] = grassMeshSubdivision * 4;
-            triangles[grassMeshSubdivision * 6 + 1] = grassMeshSubdivision * 4 + 1;
-            triangles[grassMeshSubdivision * 6 + 2] = grassMeshSubdivision * 4 + 2;
+		cachedGrassMesh = new Mesh();
+		var vertexCount = 3 + 4 * grassMeshSubdivision;
+		var triangleCount = (1 + 2 * grassMeshSubdivision) * 3;
 
-            cachedGrassMesh.SetVertices(vertices);
-            cachedGrassMesh.SetTriangles(triangles, 0);
+		var vertices = new Vector3[vertexCount];
+		var triangles = new int[triangleCount];
 
-            oldSubdivision = grassMeshSubdivision;
-        }
-        
-        return cachedGrassMesh;
-    }
-    Bounds CalculateCameraBounds(Camera camera)
-    {
-        Vector3 ntopLeft = camera.ViewportToWorldPoint(new Vector3(0, 1, camera.nearClipPlane));
-        Vector3 ntopRight = camera.ViewportToWorldPoint(new Vector3(1, 1, camera.nearClipPlane));
-        Vector3 nbottomLeft = camera.ViewportToWorldPoint(new Vector3(0, 0, camera.nearClipPlane));
-        Vector3 nbottomRight = camera.ViewportToWorldPoint(new Vector3(1, 0, camera.nearClipPlane));
+		for (var i = 0; i < grassMeshSubdivision; i++)
+		{
+			var y1 = (float)i / (grassMeshSubdivision + 1);
+			var y2 = (float)(i + 1) / (grassMeshSubdivision + 1);
 
-        Vector3 ftopLeft = camera.ViewportToWorldPoint(new Vector3(0, 1, drawDistance));
-        Vector3 ftopRight = camera.ViewportToWorldPoint(new Vector3(1, 1, drawDistance));
-        Vector3 fbottomLeft = camera.ViewportToWorldPoint(new Vector3(0, 0, drawDistance));
-        Vector3 fbottomRight = camera.ViewportToWorldPoint(new Vector3(1, 0, drawDistance));
+			var baseIndex = i * 4;
+			vertices[baseIndex] = new Vector3(-0.25f, y1);
+			vertices[baseIndex + 1] = new Vector3(0.25f, y1);
+			vertices[baseIndex + 2] = new Vector3(-0.25f, y2);
+			vertices[baseIndex + 3] = new Vector3(0.25f, y2);
 
-        float[] xValues = new float[] { ftopLeft.x, ftopRight.x, ntopLeft.x, ntopRight.x, fbottomLeft.x, fbottomRight.x, nbottomLeft.x, nbottomRight.x };
-        float startX = xValues.Max();
-        float endX = xValues.Min();
+			var triBaseIndex = i * 6;
+			triangles[triBaseIndex] = baseIndex;
+			triangles[triBaseIndex + 1] = baseIndex + 3;
+			triangles[triBaseIndex + 2] = baseIndex + 1;
+			triangles[triBaseIndex + 3] = baseIndex;
+			triangles[triBaseIndex + 4] = baseIndex + 2;
+			triangles[triBaseIndex + 5] = baseIndex + 3;
+		}
 
-        float[] yValues = new float[] { ftopLeft.y, ftopRight.y, ntopLeft.y, ntopRight.y, fbottomLeft.y, fbottomRight.y, nbottomLeft.y, nbottomRight.y };
-        float startY = yValues.Max();
-        float endY = yValues.Min();
+		var topVertexIndex = grassMeshSubdivision * 4;
+		vertices[topVertexIndex] = new Vector3(-0.25f, (float)grassMeshSubdivision / (grassMeshSubdivision + 1));
+		vertices[topVertexIndex + 1] = new Vector3(0, 1);
+		vertices[topVertexIndex + 2] = new Vector3(0.25f, (float)grassMeshSubdivision / (grassMeshSubdivision + 1));
 
-        float[] zValues = new float[] { ftopLeft.z, ftopRight.z, ntopLeft.z, ntopRight.z, fbottomLeft.z, fbottomRight.z, nbottomLeft.z, nbottomRight.z };
-        float startZ = zValues.Max();
-        float endZ = zValues.Min();
+		var topTriBaseIndex = grassMeshSubdivision * 6;
+		triangles[topTriBaseIndex] = topVertexIndex;
+		triangles[topTriBaseIndex + 1] = topVertexIndex + 1;
+		triangles[topTriBaseIndex + 2] = topVertexIndex + 2;
 
-        Vector3 center = new Vector3((startX + endX) / 2, (startY + endY) / 2, (startZ + endZ) / 2);
-        Vector3 size = new Vector3(Mathf.Abs(startX - endX), Mathf.Abs(startY - endY), Mathf.Abs(startZ - endZ));
+		cachedGrassMesh.SetVertices(vertices);
+		cachedGrassMesh.SetTriangles(triangles, 0);
 
-        Bounds bounds = new Bounds(center, size);
-        bounds.Expand(1);
-        return bounds;
-    }
+		oldSubdivision = grassMeshSubdivision;
+		return cachedGrassMesh;
+	}
 
+	private static Bounds CalculateCameraBounds(Camera sourceCamera, float drawDistance)
+	{
+		var nearCorners = new[]
+		{
+			sourceCamera.ViewportToWorldPoint(new Vector3(0, 1, sourceCamera.nearClipPlane)),
+			sourceCamera.ViewportToWorldPoint(new Vector3(1, 1, sourceCamera.nearClipPlane)),
+			sourceCamera.ViewportToWorldPoint(new Vector3(0, 0, sourceCamera.nearClipPlane)),
+			sourceCamera.ViewportToWorldPoint(new Vector3(1, 0, sourceCamera.nearClipPlane))
+		};
+
+		var farCorners = new[]
+		{
+			sourceCamera.ViewportToWorldPoint(new Vector3(0, 1, drawDistance)),
+			sourceCamera.ViewportToWorldPoint(new Vector3(1, 1, drawDistance)),
+			sourceCamera.ViewportToWorldPoint(new Vector3(0, 0, drawDistance)),
+			sourceCamera.ViewportToWorldPoint(new Vector3(1, 0, drawDistance))
+		};
+
+		var startX = Mathf.Max(farCorners[0].x, farCorners[1].x, nearCorners[0].x, nearCorners[1].x, farCorners[2].x, farCorners[3].x, nearCorners[2].x, nearCorners[3].x);
+		var endX = Mathf.Min(farCorners[0].x, farCorners[1].x, nearCorners[0].x, nearCorners[1].x, farCorners[2].x, farCorners[3].x, nearCorners[2].x, nearCorners[3].x);
+
+		var startY = Mathf.Max(farCorners[0].y, farCorners[1].y, nearCorners[0].y, nearCorners[1].y, farCorners[2].y, farCorners[3].y, nearCorners[2].y, nearCorners[3].y);
+		var endY = Mathf.Min(farCorners[0].y, farCorners[1].y, nearCorners[0].y, nearCorners[1].y, farCorners[2].y, farCorners[3].y, nearCorners[2].y, nearCorners[3].y);
+
+		var startZ = Mathf.Max(farCorners[0].z, farCorners[1].z, nearCorners[0].z, nearCorners[1].z, farCorners[2].z, farCorners[3].z, nearCorners[2].z, nearCorners[3].z);
+		var endZ = Mathf.Min(farCorners[0].z, farCorners[1].z, nearCorners[0].z, nearCorners[1].z, farCorners[2].z, farCorners[3].z, nearCorners[2].z, nearCorners[3].z);
+
+		var center = new Vector3((startX + endX) / 2, (startY + endY) / 2, (startZ + endZ) / 2);
+		var size = new Vector3(Mathf.Abs(startX - endX), Mathf.Abs(startY - endY), Mathf.Abs(startZ - endZ));
+
+		var bounds = new Bounds(center, size);
+		bounds.Expand(1);
+		return bounds;
+	}
 }

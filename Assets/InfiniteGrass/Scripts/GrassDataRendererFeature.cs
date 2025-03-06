@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.RenderGraphModule;
 using UnityEngine.Rendering.Universal;
 
 public class GrassDataRendererFeature : ScriptableRendererFeature
@@ -37,6 +39,16 @@ public class GrassDataRendererFeature : ScriptableRendererFeature
 		public LayerMask heightMapLayer;
 		public Material heightMapMat;
 		public ComputeShader computeShader;
+	}
+
+	public class GrassData : ContextItem
+	{
+		public TextureHandle FilterTextureHandle;
+
+		public override void Reset()
+		{
+			FilterTextureHandle = TextureHandle.nullHandle;
+		}
 	}
 
 

@@ -6,7 +6,7 @@ using UnityEngine.Rendering.Universal;
 
 class GrassDataPass : ScriptableRenderPass
 {
-	private List<ShaderTagId> shaderTagsList = new List<ShaderTagId>();
+	private readonly List<ShaderTagId> shaderTagsList = new();
 
 	private RTHandle heightRT;
 	private RTHandle heightDepthRT;
@@ -54,7 +54,7 @@ class GrassDataPass : ScriptableRenderPass
 		if (!ValidateComponents()) return;
 
 		var cmd = CommandBufferPool.Get();
-		var renderer = InfiniteGrassRenderer.instance;
+		var renderer = InfiniteGrassRenderer.Instance;
 		var camera = Camera.main;
 
 		var cameraBounds = CalculateCameraBounds(camera, renderer.drawDistance);
@@ -72,7 +72,7 @@ class GrassDataPass : ScriptableRenderPass
 
 	private bool ValidateComponents()
 	{
-		return InfiniteGrassRenderer.instance != null && heightMapMat != null && computeShader != null;
+		return InfiniteGrassRenderer.Instance != null && heightMapMat != null && computeShader != null;
 	}
 
 	private static void SetupCamera(CommandBuffer cmd, Bounds cameraBounds, Vector2 centerPos, InfiniteGrassRenderer renderer)
@@ -156,11 +156,11 @@ class GrassDataPass : ScriptableRenderPass
 		cmd.DispatchCompute(computeShader, 0, Mathf.CeilToInt((float)gridSize.x / 8), Mathf.CeilToInt((float)gridSize.y / 8), 1);
 
 		cmd.SetGlobalBuffer("_GrassPositions", grassPositionsBuffer);
-		cmd.CopyCounterValue(grassPositionsBuffer, renderer.argsBuffer, 4);
+		cmd.CopyCounterValue(grassPositionsBuffer, renderer.ArgsBuffer, 4);
 
 		if (renderer.previewVisibleGrassCount)
 		{
-			cmd.CopyCounterValue(grassPositionsBuffer, renderer.tBuffer, 0);
+			cmd.CopyCounterValue(grassPositionsBuffer, renderer.TemporalBuffer, 0);
 		}
 	}
 
@@ -171,7 +171,6 @@ class GrassDataPass : ScriptableRenderPass
 			Mathf.Floor(camera.transform.position.z / textureUpdateThreshold) * textureUpdateThreshold
 		);
 	}
-
 
 	private static Bounds CalculateCameraBounds(Camera camera, float drawDistance)
 	{
